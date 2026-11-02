@@ -1,0 +1,55 @@
+# Lunch Money Auto-Split - example configuration
+# ---------------------------------------------------------------
+# The easiest way to make your own config is the guided setup:
+#     python autosplit.py setup
+# It creates config.toml for you. This file shows every option
+# if you prefer to write or edit the config by hand.
+
+# How many days back to look for transactions on each run.
+lookback_days = 30
+
+# ---------------------------------------------------------------
+# Example 1: phone + internet bill, split by proportion.
+# The same proportions are used even when the total changes.
+[[rule]]
+name = "Phone and internet bill"
+
+# Words that must ALL appear in the payee name (not case-sensitive).
+payee_contains = ["ROGERS"]
+
+# Optional: only match transactions from accounts whose name contains this.
+account_contains = "Credit"
+
+# Optional: only match charges in this range.
+# min_amount = 100
+# max_amount = 200
+
+# "percent" = values are percentages; "amount" = values are fixed amounts.
+split_by = "percent"
+
+[[rule.part]]
+category = "Phone"          # category name as shown in Lunch Money
+value = 58.33               # percent of the charge
+
+[[rule.part]]
+category = "Internet"
+value = "rest"              # whatever is left (one part can be "rest")
+
+# ---------------------------------------------------------------
+# Example 2: warehouse-club run, fixed amount for one category.
+[[rule]]
+name = "Costco"
+payee_contains = ["COSTCO"]
+split_by = "amount"
+
+[[rule.part]]
+category = "Household"
+value = 40                  # always 40.00 to Household
+
+[[rule.part]]
+category = "Groceries"
+value = "rest"              # the remainder to Groceries
+
+# Tip: if two categories have the same name, add the exact ID from
+#     python autosplit.py categories
+# e.g.  category_id = 1234567

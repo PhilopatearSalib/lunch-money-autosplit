@@ -1,0 +1,8 @@
+# Personal files - never commit these
+config.toml
+.lunchmoney-token
+autosplit.log*
+
+__pycache__/
+*.pyc
+.venv/
