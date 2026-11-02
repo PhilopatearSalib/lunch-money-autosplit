@@ -136,6 +136,7 @@ Check that its payee contains all of your `payee_contains` words, that it's with
 
 ## Notes
 
+- Tested on Windows 11. Mac and Linux support (via cron) is untested; reports are welcome in the Issues tab.
 - Uses the [Lunch Money Developer API](https://lunchmoney.dev) (v1).
 - Requires Python 3.11+ and the `requests` package.
 - Not affiliated with Lunch Money.
