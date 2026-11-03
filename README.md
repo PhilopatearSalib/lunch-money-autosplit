@@ -14,7 +14,9 @@ Some bills arrive as one charge but cover several things: a phone and internet b
 - Splits each one into the categories you chose, by percentage or fixed amounts
 - Runs every day on its own once scheduled, and never touches a transaction that is already split
 
-**Safe by default:** every run is a preview unless you add `--apply`, refunds and income are ignored, and your access token stays on your own computer.
+**Safe by default:** every run is a preview unless you add `--apply`, refunds, income and pending charges are left alone, and your access token stays on your own computer.
+
+> **Lunch Money's built-in split rules** can also split a transaction by percentage (Setup → Rules → split). If they cover your case, use them: they run as soon as a transaction is imported. This tool is for when you want a preview of exactly what will change before anything is touched, a guided setup that works out the proportions from a real bill, or a log of every split.
 
 ---
 
@@ -63,13 +65,16 @@ python autosplit.py setup
 
 The setup asks a few simple questions:
 
-1. **Your token.** Paste it and press Enter. Nothing appears while you paste; that's normal. It then offers to save the token in this folder so the daily run can use it.
+1. **Your token.** Paste it and press Enter. Nothing appears while you paste; that's normal. Then choose where to keep it:
+   - **Environment variable `LUNCHMONEY_TOKEN`** (recommended). On Windows the setup sets it for you; on Mac and Linux it shows the line to add. See [Keeping your token safe](#keeping-your-token-safe).
+   - **A token file in the tool's folder.** Convenient, but stored as plain text.
+   - **Neither**, if you'd rather set it up yourself.
 2. **Which charge to split.** Type text from the payee name, for example `ROGERS`. It shows matching transactions from the last few months so you can confirm it's the right one.
 3. **How many categories,** and **how to divide the charge:**
    - **Copy a past bill** (recommended): enter how one real bill splits, for example Phone 79.10 and Internet 56.50. The same proportions are used every month, even if the total changes.
    - **Percentages:** for example 60% / 40%.
    - **Fixed amounts:** for example always 40.00 to Household, with the rest going to Groceries.
-4. **Which categories.** Pick each one by its number or by typing part of its name.
+4. **Which categories.** Type part of a category's name, for example `phone`. Type `?` to see the full list.
 
 Then it does a **dry run** that shows what it would split without changing anything, and asks whether to split those transactions now.
 
@@ -78,7 +83,7 @@ Then it does a **dry run** that shows what it would split without changing anyth
 At the end of setup, answer **yes** to "Run automatically every day?" and pick a time.
 
 - **Windows:** a Task Scheduler task called "Lunch Money Auto-Split" is created for you. If your computer is off at that time, it runs as soon as it's back on.
-- **Mac / Linux:** the tool prints one line to paste into your crontab (`crontab -e`).
+- **Mac / Linux:** the tool prints the lines to paste into your crontab (`crontab -e`), including how to give cron your token.
 
 You're done. New matching charges are split within a day of appearing in Lunch Money.
 
@@ -94,8 +99,9 @@ You're done. New matching charges are split within a day of appearing in Lunch M
 | `python autosplit.py categories` | List your categories and their IDs |
 | `python autosplit.py schedule --time 09:30` | Set or change the daily run |
 | `python autosplit.py unschedule` | Stop the daily run |
+| `python autosplit.py run --no-log` | Run without writing `autosplit.log` (also works with `schedule`) |
 
-Each automatic run writes its results to `autosplit.log` in the tool's folder.
+Each run writes its results to `autosplit.log` in the tool's folder. See [What the log contains](#what-the-log-contains).
 
 ## Editing rules by hand
 
@@ -124,7 +130,51 @@ The token was revoked or mistyped. Create a new one (Step 4) and run `python aut
 Lunch Money's API was slow or unavailable. The tool retries automatically. If it still fails, the next daily run will catch up.
 
 **A charge wasn't split**
-Check that its payee contains all of your `payee_contains` words, that it's within `lookback_days` (30 by default), and that the bank account has synced in Lunch Money.
+Check that its payee contains all of your `payee_contains` words, that it's within `lookback_days` (30 by default), and that the bank account has synced in Lunch Money. Pending charges are skipped until they post, because their amount can still change.
+
+## Keeping your token safe
+
+Your access token gives full access to your Lunch Money budget, so treat it like a password.
+
+**Recommended: the `LUNCHMONEY_TOKEN` environment variable.** The tool always uses it first if it's set.
+
+- **Windows:** the setup can set it for you. To do it yourself, run this in PowerShell with your token in the quotes, then open a new terminal window:
+  ```
+  setx LUNCHMONEY_TOKEN "your-token"
+  ```
+  The Task Scheduler run uses it automatically.
+- **Mac (zsh):** add this line to `~/.zshrc`, then open a new terminal:
+  ```
+  export LUNCHMONEY_TOKEN="your-token"
+  ```
+- **Linux (bash):** add the same line to `~/.bashrc`.
+- **cron (Mac and Linux):** cron doesn't read those files. Add this line at the top of your crontab (`crontab -e`), above the schedule line. Your crontab is readable only by you.
+  ```
+  LUNCHMONEY_TOKEN="your-token"
+  ```
+
+**Optional: the token file.** If you choose the token file during setup, the token is saved as **plain text** in `.lunchmoney-token` next to the script. On Mac and Linux the file is made readable only by your user account. Anyone who can read the file can use your budget, so don't share the folder or commit the file. The included `.gitignore` already excludes it. On Windows, the setup offers to move an existing token file into the environment variable.
+
+If a token is ever exposed, revoke it in Lunch Money under **Developers** and create a new one.
+
+## What the log contains
+
+`autosplit.log` records each run: the date, payee, amount, rule name and categories of every transaction it matched or split, plus any errors. That's useful for checking what the daily run did, but it's personal financial information.
+
+- Keep the log private; it's excluded by `.gitignore`.
+- It's capped at about 200 KB, plus one older copy (`autosplit.log.1`).
+- To turn it off, add `--no-log`: `python autosplit.py run --apply --no-log`, or `python autosplit.py schedule --no-log` for the daily run.
+- You can delete the log files at any time.
+
+## Running the tests
+
+The tests cover matching, rounding and the split calculations, plus the config file and the run loop. They use a fake Lunch Money API, so they need no account or internet connection:
+
+```
+python -m unittest discover -s tests -v
+```
+
+They also run automatically on Windows, Mac and Linux for every push (see the Actions tab).
 
 ## Removing it
 
@@ -136,8 +186,9 @@ Check that its payee contains all of your `payee_contains` words, that it's with
 
 ## Notes
 
-- Tested on Windows 11. Mac and Linux support (via cron) is untested; reports are welcome in the Issues tab.
-- Uses the [Lunch Money Developer API](https://lunchmoney.dev) (v1).
+- Tested end-to-end with a real account on Windows 11. The automated tests also run on Mac and Linux, but daily runs with cron haven't been tried there yet; reports are welcome in the Issues tab.
+- Uses the [Lunch Money Developer API v2](https://lunchmoney.dev) (`https://api.lunchmoney.dev/v2`). Version 1.x of this tool used the older v1 API.
+- Planned: storing the token in Windows Credential Manager or the Mac Keychain.
 - Requires Python 3.11+ and the `requests` package.
 - Not affiliated with Lunch Money.
 

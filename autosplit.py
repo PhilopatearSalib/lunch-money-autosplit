@@ -44,9 +44,10 @@ except ImportError:
     sys.exit("The 'requests' package is missing. Install it with:\n"
              "    python -m pip install requests")
 
-__version__ = "1.0.1"
+__version__ = "2.0.0"
 
-API_BASE = "https://dev.lunchmoney.app/v1"
+API_BASE = "https://api.lunchmoney.dev/v2"
+MAX_PAGES = 50                                   # safety stop when paging through transactions
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.toml"
 TOKEN_FILE = HERE / ".lunchmoney-token"
@@ -83,6 +84,7 @@ class LunchMoney:
         self.session = requests.Session()
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.session.headers["Authorization"] = f"Bearer {token}"
+        self._account_names: dict | None = None
 
     def _call(self, method: str, path: str, **kwargs):
         try:
@@ -92,11 +94,13 @@ class LunchMoney:
                            f"Check your internet connection or try again later.\n"
                            f"  Details: {e}") from e
         if r.status_code == 401:
-            raise ApiError("Lunch Money rejected the access token. Create a new token "
-                           "and run:  python autosplit.py setup", auth=True)
+            raise ApiError(f"Lunch Money rejected the access token ({error_text(r)}). "
+                           "Create a new token and run:  python autosplit.py setup", auth=True)
         if not r.ok:
             raise ApiError(f"Lunch Money returned HTTP {r.status_code} for "
-                           f"{method} {path}: {r.text[:300]}")
+                           f"{method} {path}: {error_text(r)}")
+        if r.status_code == 204 or not r.content:
+            return {}
         try:
             data = r.json()
         except ValueError as e:
@@ -109,32 +113,118 @@ class LunchMoney:
         return self._call("GET", "/me")
 
     def categories(self) -> list[dict]:
-        return self._call("GET", "/categories")["categories"]
+        """All categories and category groups in one flat list."""
+        return self._call("GET", "/categories", params={"format": "flattened"})["categories"]
 
-    def transactions(self, start: dt.date, end: dt.date) -> list[dict]:
+    def account_names(self) -> dict:
+        """Maps ("plaid" | "manual", account id) to a readable account name.
+
+        v2 transactions carry only account IDs, so the names are looked up once.
+        """
+        if self._account_names is None:
+            names = {}
+            for kind, path, key in (("plaid", "/plaid_accounts", "plaid_accounts"),
+                                    ("manual", "/manual_accounts", "manual_accounts")):
+                for acc in self._call("GET", path).get(key, []):
+                    label = acc.get("display_name") or " ".join(
+                        x for x in (acc.get("institution_name"), acc.get("name")) if x)
+                    names[(kind, acc["id"])] = label
+            self._account_names = names
+        return self._account_names
+
+    def transactions(self, start: dt.date, end: dt.date,
+                     include_split_parents: bool = False) -> list[dict]:
+        """Every non-pending transaction in the date range, following pagination.
+
+        Each transaction gets an extra "_account" key with its account name.
+        """
         params = {"start_date": start.isoformat(), "end_date": end.isoformat()}
-        return self._call("GET", "/transactions", params=params)["transactions"]
+        if include_split_parents:
+            params["include_split_parents"] = "true"
+        out: list[dict] = []
+        for _ in range(MAX_PAGES):
+            data = self._call("GET", "/transactions", params={**params, "offset": len(out)})
+            batch = data.get("transactions", [])
+            out.extend(batch)
+            if not data.get("has_more") or not batch:
+                break
+        else:
+            raise ApiError(f"Too many transactions to page through ({len(out)}+). "
+                           "Lower lookback_days in config.toml.")
+        names = self.account_names()
+        for t in out:
+            if t.get("plaid_account_id"):
+                t["_account"] = names.get(("plaid", t["plaid_account_id"]), "")
+            elif t.get("manual_account_id"):
+                t["_account"] = names.get(("manual", t["manual_account_id"]), "")
+            else:
+                t["_account"] = ""
+        return out
 
     def split(self, transaction_id: int, parts: list[dict]) -> dict:
-        return self._call("PUT", f"/transactions/{transaction_id}", json={"split": parts})
+        return self._call("POST", f"/transactions/split/{transaction_id}",
+                          json={"child_transactions": parts})
+
+
+def error_text(r) -> str:
+    """Readable message from a v2 error body: {"message": ..., "errors": [{"errMsg": ...}]}."""
+    try:
+        data = r.json()
+    except ValueError:
+        return r.text[:300] or r.reason or "no details"
+    if isinstance(data, dict):
+        details = [e.get("errMsg") for e in data.get("errors") or []
+                   if isinstance(e, dict) and e.get("errMsg")]
+        text = data.get("message") or data.get("error") or ""
+        if details:
+            text = f"{text}: {'; '.join(details)}" if text else "; ".join(details)
+        if text:
+            return str(text)
+    return r.text[:300]
+
+
+def token_source() -> tuple[str | None, str]:
+    """Returns (token, where it came from). The environment variable wins."""
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if token:
+        return token, f"the {TOKEN_ENV} environment variable"
+    if TOKEN_FILE.exists():
+        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            return token, f"the token file {TOKEN_FILE.name} (plain text)"
+    return None, ""
 
 
 def get_token() -> str | None:
-    token = os.environ.get(TOKEN_ENV, "").strip()
-    if token:
-        return token
-    if TOKEN_FILE.exists():
-        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        return token or None
-    return None
+    return token_source()[0]
 
 
 def save_token(token: str) -> None:
+    """Optional convenience: store the token in a plain-text file next to the script."""
     TOKEN_FILE.write_text(token, encoding="utf-8")
     try:
-        os.chmod(TOKEN_FILE, 0o600)
+        os.chmod(TOKEN_FILE, 0o600)                 # owner-only on Mac/Linux
     except OSError:
         pass
+
+
+def set_windows_env(token: str) -> bool:
+    """Store the token as a user environment variable on Windows (used by scheduled runs)."""
+    r = subprocess.run(["setx", TOKEN_ENV, token], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def env_instructions(system: str | None = None) -> str:
+    system = system or platform.system()
+    if system == "Windows":
+        return (f"In PowerShell, run (with your token in the quotes):\n"
+                f"    setx {TOKEN_ENV} \"your-token\"\n"
+                "Then open a new terminal window.")
+    profile = "~/.zshrc" if system == "Darwin" else "~/.bashrc"
+    return (f"Add this line to {profile} (with your token in the quotes), then open a new terminal:\n"
+            f"    export {TOKEN_ENV}=\"your-token\"\n"
+            "Scheduled runs with cron don't read that file; 'python autosplit.py schedule'\n"
+            "shows how to give cron the token.")
 
 
 def get_client() -> LunchMoney:
@@ -154,17 +244,28 @@ def clean(text: str) -> str:
 
 
 def account_name(t: dict) -> str:
-    for key in ("plaid_account_display_name", "plaid_account_name",
-                "asset_display_name", "asset_name"):
-        if t.get(key):
-            return str(t[key])
-    return ""
+    """Account name added by LunchMoney.transactions()."""
+    return str(t.get("_account") or "")
+
+
+def is_split_part(t: dict) -> bool:
+    """One of the pieces a transaction was split into."""
+    return bool(t.get("split_parent_id"))
 
 
 def already_split(t: dict) -> bool:
-    """True for split parents, parts of a split, and grouped transactions."""
-    return bool(t.get("parent_id") or t.get("has_children")
-                or t.get("is_group") or t.get("group_id"))
+    """True for split parents, split parts, transaction groups and grouped transactions.
+
+    In v2, GET /transactions returns the parts of a split instead of the original,
+    so the parts (split_parent_id set) are what usually needs skipping.
+    """
+    return bool(t.get("is_split_parent") or is_split_part(t)
+                or t.get("is_group_parent") or t.get("group_parent_id"))
+
+
+def usable_categories(categories: list[dict]) -> list[dict]:
+    """Categories a charge can be split into: no groups, nothing archived."""
+    return [c for c in categories if not c.get("is_group") and not c.get("archived")]
 
 
 def is_number(v) -> bool:
@@ -291,7 +392,7 @@ def write_config(path: Path, lookback: int, rules: list[dict]) -> None:
 
 
 def resolve_categories(rules: list[dict], categories: list[dict]) -> None:
-    usable = [c for c in categories if not c.get("is_group")]
+    usable = usable_categories(categories)
     by_id = {c["id"]: c for c in usable}
     for r in rules:
         for p in r["part"]:
@@ -353,7 +454,7 @@ def compute_split(rule: dict, total: float) -> list[float]:
     return [float(a) for a in amounts]
 
 
-def setup_logging() -> None:
+def setup_logging(write_file: bool = True) -> None:
     if log.handlers:
         return
     log.setLevel(logging.INFO)
@@ -361,6 +462,8 @@ def setup_logging() -> None:
         console = logging.StreamHandler(sys.stdout)
         console.setFormatter(logging.Formatter("%(message)s"))
         log.addHandler(console)
+    if not write_file:
+        return
     try:
         fh = RotatingFileHandler(LOG_FILE, maxBytes=200_000, backupCount=1, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s"))
@@ -369,9 +472,12 @@ def setup_logging() -> None:
         pass
 
 
-def run_rules(config: Path, apply: bool) -> tuple[int, int]:
-    """Returns (exit_code, number_of_transactions_that_would_be/were_split)."""
-    setup_logging()
+def run_rules(config: Path, apply: bool, write_log: bool = True) -> tuple[int, int]:
+    """Returns (exit_code, number_of_transactions_that_would_be/were_split).
+
+    The log file records payees, amounts and categories; write_log=False turns it off.
+    """
+    setup_logging(write_log)
     log.info(f"Lunch Money Auto-Split {__version__} - {'APPLY' if apply else 'dry run'}")
     try:
         lookback, rules = load_config(config)
@@ -388,9 +494,10 @@ def run_rules(config: Path, apply: bool) -> tuple[int, int]:
         if already_split(t):
             continue
         try:
-            amount = round(float(t.get("amount", 0)), 2)
+            raw_amount = float(t.get("amount", 0))
         except (TypeError, ValueError):
             continue
+        amount = round(raw_amount, 2)
         if amount <= 0:                             # refunds and income
             continue
         rule = next((r for r in rules if rule_matches(r, t, amount)), None)
@@ -398,6 +505,9 @@ def run_rules(config: Path, apply: bool) -> tuple[int, int]:
             continue
 
         head = f"{t.get('date')}  {t.get('payee')}  {amount:.2f}  [{rule['name']}]"
+        if abs(raw_amount - amount) > 1e-6:
+            log.warning(f"{head} skipped: amount {t.get('amount')} has more than 2 decimal places")
+            continue
         try:
             amounts = compute_split(rule, amount)
         except ValueError as e:
@@ -522,11 +632,13 @@ def pick_category(cats: list[dict], prompt: str, groups: dict) -> dict:
 def preview_matches(lm: LunchMoney, words: list[str]) -> list[dict]:
     end = dt.date.today()
     try:
-        txs = lm.transactions(end - dt.timedelta(days=PREVIEW_DAYS), end)
+        txs = lm.transactions(end - dt.timedelta(days=PREVIEW_DAYS), end,
+                              include_split_parents=True)
     except ApiError as e:
         print(f"  (Couldn't load recent transactions to preview: {e})")
         return []
-    hits = [t for t in txs if not t.get("parent_id")
+    # Show each original charge once: split originals are included, their parts are not.
+    hits = [t for t in txs if not is_split_part(t)
             and all(w.lower() in (t.get("payee") or "").lower() for w in words)]
     return sorted(hits, key=lambda t: t.get("date", ""), reverse=True)
 
@@ -544,16 +656,53 @@ Keep the token private: anyone who has it can see and change your budget.
 """
 
 
+def who(me: dict) -> str:
+    return me.get("name") or me.get("email") or "you"
+
+
+def store_token(token: str) -> None:
+    """Ask where to keep the token. The environment variable is recommended."""
+    os.environ[TOKEN_ENV] = token                   # use it for the rest of this setup
+    windows = platform.system() == "Windows"
+    print("\nWhere should the token be kept on this computer?")
+    print(f"  1) Environment variable {TOKEN_ENV} (recommended)"
+          + ("" if windows else " - I'll show you the line to add"))
+    print(f"  2) Token file in this folder ({TOKEN_FILE.name}) - convenient, but plain text")
+    print("  3) Don't keep it - I'll set it up myself")
+    choice = ask_choice("Choose 1, 2 or 3", ["1", "2", "3"], "1")
+    if choice == "1" and windows:
+        if set_windows_env(token):
+            print(f"  Saved as {TOKEN_ENV}. Scheduled runs and new terminal windows will use it.")
+            return
+        print("  Couldn't set it automatically.")
+    if choice == "2":
+        save_token(token)
+        print(f"  Saved to {TOKEN_FILE}.")
+        print("  This file is plain text: anyone who can read it can use your budget.")
+        print("  Keep it private and never share or commit it.")
+        return
+    print("  " + env_instructions().replace("\n", "\n  "))
+
+
 def ensure_token() -> str | None:
-    token = get_token()
+    token, source = token_source()
     if token:
         try:
             me = LunchMoney(token).me()
-            print(f"Connected to Lunch Money as {me.get('user_name') or me.get('user_email') or 'you'} "
-                  "using your saved token.")
+            print(f"Connected to Lunch Money as {who(me)} using {source}.")
+            if (TOKEN_FILE.exists() and not os.environ.get(TOKEN_ENV)
+                    and platform.system() == "Windows"
+                    and yes(f"Move the token from the plain-text file into the {TOKEN_ENV} "
+                            "environment variable (recommended)?", True)):
+                if set_windows_env(token):
+                    os.environ[TOKEN_ENV] = token
+                    TOKEN_FILE.unlink()
+                    print(f"  Done. Moved to {TOKEN_ENV} and deleted {TOKEN_FILE.name}.")
+                else:
+                    print("  Couldn't set the variable; keeping the token file.")
             return token
         except ApiError as e:
-            print(f"Your saved token didn't work: {e}")
+            print(f"The saved token didn't work: {e}")
             if not e.auth:
                 return None
 
@@ -570,14 +719,10 @@ def ensure_token() -> str | None:
             if not e.auth:
                 return None
             continue
-        print(f"Connected as {me.get('user_name') or me.get('user_email') or 'you'}.")
+        print(f"Connected as {who(me)}.")
         break
 
-    if yes(f"Save the token in this folder ({TOKEN_FILE.name}) so automatic runs can use it?", True):
-        save_token(token)
-        print(f"  Saved to {TOKEN_FILE}. Keep this file private.")
-    else:
-        print(f"  OK. Set the {TOKEN_ENV} environment variable yourself before each run.")
+    store_token(token)
     return token
 
 
@@ -664,7 +809,7 @@ def cmd_setup(args) -> int:
         print(e)
         return 1
     groups = {c["id"]: c["name"] for c in all_cats if c.get("is_group")}
-    cats = sorted((c for c in all_cats if not c.get("is_group")), key=lambda c: clean(c["name"]))
+    cats = sorted(usable_categories(all_cats), key=lambda c: clean(c["name"]))
     if len(cats) < 2:
         print("You need at least two categories in Lunch Money to split into.")
         return 1
@@ -707,13 +852,14 @@ def cmd_setup(args) -> int:
 
     if yes("\nRun automatically every day?", True):
         when = ask("What time each day? (24-hour HH:MM)", "10:00")
-        cmd_schedule(argparse.Namespace(config=str(config), time=when))
+        cmd_schedule(argparse.Namespace(config=str(config), time=when, no_log=False))
 
     print("\nAll set. Useful commands:")
     print("  python autosplit.py run           see what would be split")
     print("  python autosplit.py run --apply   split now")
     print("  python autosplit.py setup         add more rules")
-    print(f"Results of automatic runs are written to {LOG_FILE.name}")
+    print(f"Results of automatic runs are written to {LOG_FILE.name} "
+          "(it records payees, amounts and categories).")
     return 0
 
 
@@ -721,7 +867,7 @@ def cmd_setup(args) -> int:
 # Other commands
 # --------------------------------------------------------------------------
 def cmd_run(args) -> int:
-    code, _ = run_rules(Path(args.config), apply=args.apply)
+    code, _ = run_rules(Path(args.config), apply=args.apply, write_log=not args.no_log)
     return code
 
 
@@ -732,7 +878,7 @@ def cmd_categories(args) -> int:
         print(e)
         return 1
     groups = {c["id"]: c["name"] for c in cats if c.get("is_group")}
-    rows = sorted((c for c in cats if not c.get("is_group")),
+    rows = sorted(usable_categories(cats),
                   key=lambda c: (clean(groups.get(c.get("group_id"), "")), clean(c["name"])))
     print(f"{'ID':>10}  CATEGORY")
     for c in rows:
@@ -766,7 +912,8 @@ def cmd_schedule(args) -> int:
         if exe.with_name("pythonw.exe").exists():
             exe = exe.with_name("pythonw.exe")       # runs without a console window
         q = lambda s: str(s).replace("'", "''")
-        argument = f'"{script}" run --apply --config "{config}"'
+        extra = " --no-log" if getattr(args, "no_log", False) else ""
+        argument = f'"{script}" run --apply --config "{config}"{extra}'
         r = _powershell(
             f"$a = New-ScheduledTaskAction -Execute '{q(exe)}' -Argument '{q(argument)}' "
             f"-WorkingDirectory '{q(HERE)}'; "
@@ -781,15 +928,24 @@ def cmd_schedule(args) -> int:
             return 1
         print(f"Scheduled \"{TASK_NAME}\" every day at {hour:02d}:{minute:02d}.")
         print("If the computer is off at that time, it runs as soon as it's back on.")
-        print(f"Results are written to {LOG_FILE}")
+        if not getattr(args, "no_log", False):
+            print(f"Results are written to {LOG_FILE} (contains transaction details).")
         return 0
 
+    extra = " --no-log" if getattr(args, "no_log", False) else ""
     line = (f'{minute} {hour} * * * cd "{HERE}" && "{sys.executable}" "{script}" '
-            f'run --apply --config "{config}" >/dev/null 2>&1')
-    print("To run it every day, add this line to your crontab.")
-    print("Open it with:  crontab -e   then paste the line, save and close:\n")
+            f'run --apply --config "{config}"{extra} >/dev/null 2>&1')
+    print("To run it every day, open your crontab with:  crontab -e")
+    if os.environ.get(TOKEN_ENV) and not TOKEN_FILE.exists():
+        print(f"cron doesn't read your shell profile, so first add this line at the top")
+        print(f"(with your token in the quotes; the crontab is readable only by you):\n")
+        print(f'{TOKEN_ENV}="your-token"\n')
+        print("Then add this schedule line, save and close:\n")
+    else:
+        print("Then add this line, save and close:\n")
     print(line)
-    print(f"\nResults are written to {LOG_FILE}")
+    if not getattr(args, "no_log", False):
+        print(f"\nResults are written to {LOG_FILE} (contains transaction details).")
     return 0
 
 
@@ -829,9 +985,13 @@ def main(argv: list[str] | None = None) -> int:
                            help="check recent transactions (dry run unless --apply)")
     run_p.add_argument("--apply", action="store_true",
                        help="actually split the matching transactions")
+    run_p.add_argument("--no-log", action="store_true",
+                       help=f"don't write {LOG_FILE.name} (it records payees, amounts and categories)")
     sub.add_parser("categories", parents=[common], help="list your Lunch Money categories")
     sched = sub.add_parser("schedule", parents=[common], help="run automatically every day")
     sched.add_argument("--time", default="10:00", help="time of day, HH:MM (default 10:00)")
+    sched.add_argument("--no-log", action="store_true",
+                       help=f"scheduled runs don't write {LOG_FILE.name}")
     sub.add_parser("unschedule", parents=[common], help="stop the automatic daily run")
 
     args = parser.parse_args(argv)
