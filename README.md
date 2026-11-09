@@ -192,6 +192,10 @@ They also run automatically on Windows, Mac and Linux for every push (see the Ac
 - Requires Python 3.11+ and the `requests` package.
 - Not affiliated with Lunch Money.
 
+## Related
+
+- [Lunch Money Dedupe](https://github.com/PhilopatearSalib/lunch-money-dedupe): find transactions you entered by hand that came in again from your bank, and merge or delete them. Uses the same `LUNCHMONEY_TOKEN`.
+
 ## License
 
 MIT © 2026 Philopatear Salib
